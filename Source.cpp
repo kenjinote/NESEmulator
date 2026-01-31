@@ -165,6 +165,7 @@ protected:
 public:
 	Mapper(Byte p, Byte c, Bus* b, std::vector<Byte>& pg, std::vector<Byte>& ch) :nPRGBanks(p), nCHRBanks(c), pBus(b), PRGData(pg), CHRData(ch) {}
 	virtual ~Mapper() {} virtual void Reset() = 0; virtual bool ppuMapRead(Word a, uint32_t& m) = 0; virtual bool ppuMapWrite(Word a, uint32_t& m) = 0; virtual MIRROR mirror() { return HARDWARE; } virtual bool irqState() { return false; } virtual void irqClear() {} virtual void tick(int) {}
+	virtual void notifyScanline() {}
 };
 class Mapper_000 :public Mapper {
 public:
@@ -243,21 +244,49 @@ public:
 	bool ppuMapRead(Word a, uint32_t& m) override { if (a < 0x2000) { m = (nCHRBankSelect * 0x2000) + a; return true; } return false; }
 	bool ppuMapWrite(Word a, uint32_t& m) override { return ppuMapRead(a, m); }
 };
+
 class Mapper_004 : public Mapper {
-	uint8_t nTargetRegister = 0; bool bPRGBankMode = false, bCHRInversion = false, bIRQActive = false, bIRQEnable = false, bIRQReload = false;
-	MIRROR mirroringMode = HORIZONTAL; uint32_t pRegister[8], pCHRBank[8]; uint8_t nIRQCounter = 0, nIRQLatch = 0;
-	std::vector<Byte> vRAM; int irq_filter_delay = 0;
+	uint8_t nTargetRegister = 0;
+	bool bPRGBankMode = false, bCHRInversion = false, bIRQActive = false, bIRQEnable = false, bIRQReload = false;
+	MIRROR mirroringMode = HORIZONTAL;
+	uint32_t pRegister[8], pCHRBank[8];
+	uint8_t nIRQCounter = 0, nIRQLatch = 0;
+	std::vector<Byte> vRAM;
+
 public:
 	using Mapper::Mapper;
+
 	void Reset() override {
-		vRAM.resize(8192); std::fill(vRAM.begin(), vRAM.end(), 0);
+		vRAM.assign(8192, 0);
 		nTargetRegister = 0; bPRGBankMode = false; bCHRInversion = false; mirroringMode = HORIZONTAL;
-		bIRQActive = false; bIRQEnable = false; nIRQCounter = 0; nIRQLatch = 0; bIRQReload = false; irq_filter_delay = 0;
-		memset(pRegister, 0, sizeof(pRegister)); memset(pCHRBank, 0, sizeof(pCHRBank)); pRegister[6] = 0; pRegister[7] = 1;
-		for (int p = 0x60; p < 0x80; p++) { pBus->MapReadPage(p, &vRAM[(p - 0x60) * 256]); pBus->MapWriteHandler(p, [this](Word a, Byte d) { vRAM[a & 0x1FFF] = d; }); }
-		for (int p = 0x80; p <= 0xFF; p++) { pBus->MapWriteHandler(p, [this](Word a, Byte d) { Write(a, d); }); }
+		bIRQActive = false; bIRQEnable = false; nIRQCounter = 0; nIRQLatch = 0; bIRQReload = false;
+		memset(pRegister, 0, sizeof(pRegister));
+		memset(pCHRBank, 0, sizeof(pCHRBank));
+		pRegister[6] = 0; pRegister[7] = 1;
+		for (int p = 0x60; p < 0x80; p++) {
+			pBus->MapReadPage(p, &vRAM[(p - 0x60) * 256]);
+			pBus->MapWriteHandler(p, [this](Word a, Byte d) { vRAM[a & 0x1FFF] = d; });
+		}
+		for (int p = 0x80; p <= 0xFF; p++) {
+			pBus->MapWriteHandler(p, [this](Word a, Byte d) { Write(a, d); });
+		}
 		UpdateBanks();
 	}
+	void notifyScanline() override {
+		if (nIRQCounter == 0 || bIRQReload) { nIRQCounter = nIRQLatch; bIRQReload = false; }
+		else nIRQCounter--;
+		if (nIRQCounter == 0 && bIRQEnable) bIRQActive = true;
+	}
+	void Write(Word addr, Byte data) {
+		if (addr >= 0x8000 && addr <= 0x9FFF) {
+			if (!(addr & 1)) { nTargetRegister = data & 0x07; bPRGBankMode = (data & 0x40); bCHRInversion = (data & 0x80); }
+			else { pRegister[nTargetRegister] = data; } UpdateBanks();
+		}
+		else if (addr >= 0xA000 && addr <= 0xBFFF) { if (!(addr & 1)) mirroringMode = (data & 1) ? HORIZONTAL : VERTICAL; }
+		else if (addr >= 0xC000 && addr <= 0xDFFF) { if (!(addr & 1)) nIRQLatch = data; else bIRQReload = true; }
+		else if (addr >= 0xE000 && addr <= 0xFFFF) { if (!(addr & 1)) { bIRQEnable = false; bIRQActive = false; } else bIRQEnable = true; }
+	}
+
 	void UpdateBanks() {
 		if (bPRGBankMode) { MapPRG(0x80, 32, nPRGBanks * 2 - 2, 8192); MapPRG(0xA0, 32, pRegister[7], 8192); MapPRG(0xC0, 32, pRegister[6], 8192); MapPRG(0xE0, 32, nPRGBanks * 2 - 1, 8192); }
 		else { MapPRG(0x80, 32, pRegister[6], 8192); MapPRG(0xA0, 32, pRegister[7], 8192); MapPRG(0xC0, 32, nPRGBanks * 2 - 2, 8192); MapPRG(0xE0, 32, nPRGBanks * 2 - 1, 8192); }
@@ -270,32 +299,25 @@ public:
 			pCHRBank[4] = pRegister[2]; pCHRBank[5] = pRegister[3]; pCHRBank[6] = pRegister[4]; pCHRBank[7] = pRegister[5];
 		}
 	}
-	void Write(Word addr, Byte data) {
-		if (addr >= 0x8000 && addr <= 0x9FFF) {
-			if (!(addr & 1)) { nTargetRegister = data & 0x07; bPRGBankMode = (data & 0x40); bCHRInversion = (data & 0x80); }
-			else { pRegister[nTargetRegister] = data; } UpdateBanks();
-		}
-		else if (addr >= 0xA000 && addr <= 0xBFFF) { if (!(addr & 1)) mirroringMode = (data & 1) ? HORIZONTAL : VERTICAL; }
-		else if (addr >= 0xC000 && addr <= 0xDFFF) { if (!(addr & 1)) nIRQLatch = data; else bIRQReload = true; }
-		else if (addr >= 0xE000 && addr <= 0xFFFF) { if (!(addr & 1)) { bIRQEnable = false; bIRQActive = false; } else bIRQEnable = true; }
-	}
 	bool ppuMapRead(Word addr, uint32_t& m) override {
-		if (addr < 0x3F00 && (addr & 0x1000)) {
-			if (irq_filter_delay <= 0) {
-				if (nIRQCounter == 0 || bIRQReload) { nIRQCounter = nIRQLatch; bIRQReload = false; }
-				else nIRQCounter--;
-				if (nIRQCounter == 0 && bIRQEnable) bIRQActive = true; irq_filter_delay = 18;
-			}
+		if (addr < 0x2000) {
+			// キャッシュされた最新のバンク設定を直接使用
+			uint32_t bank = pCHRBank[addr / 0x400];
+
+			// MOTHER等のCHR-RAM搭載ソフトでの範囲外アクセスを防止
+			int limit = (nCHRBanks > 0) ? (nCHRBanks * 8) : 8;
+			m = ((bank % limit) * 0x400) + (addr & 0x3FF);
+			return true;
 		}
-		if (addr < 0x2000) { uint32_t bank = pCHRBank[addr / 0x400]; if (nCHRBanks > 0) bank %= (nCHRBanks * 8); m = (bank * 0x400) + (addr & 0x3FF); return true; }
 		return false;
 	}
 	bool ppuMapWrite(Word a, uint32_t& m) override { return ppuMapRead(a, m); }
 	MIRROR mirror() override { return mirroringMode; }
 	bool irqState() override { return bIRQActive; }
 	void irqClear() override { bIRQActive = false; }
-	void tick(int cycles) override { if (irq_filter_delay > 0) irq_filter_delay -= cycles; }
+	void tick(int cycles) override { /* 何もしない */ }
 };
+
 class Mapper_016 : public Mapper {
 	std::vector<uint8_t> wram; uint8_t eeprom_mem[256];
 	int nPRG = 0, nCHR[8], i2c_state = 0, i2c_bit = 0;
@@ -477,21 +499,47 @@ void PPU::InternalWrite(uint16_t addr, uint8_t data) {
 }
 void PPU::RenderScanline() {
 	if (!pScreenBuffer) return;
-	int y = scanline; bool bgOpacity[256]; memset(bgOpacity, 0, 256);
+	int y = scanline;
+	uint32_t bgColor = SYSTEM_PALETTE[InternalRead(0x3F00) & 0x3F];
+	for (int i = 0; i < 256; i++) pScreenBuffer[y * 256 + i] = bgColor;
+
+	bool bgOpacity[256]; memset(bgOpacity, 0, 256);
+
 	if (mask.bits.render_bg) {
-		uint16_t coarseX = vAddr.bits.coarse_x, coarseY = vAddr.bits.coarse_y, nt = (vAddr.bits.nametable_y << 1) | vAddr.bits.nametable_x, fineY = vAddr.bits.fine_y;
+		// 現在のレジスタ状態を固定して描画に使用
+		uint16_t initial_coarse_x = vAddr.bits.coarse_x;
+		uint16_t coarse_y = vAddr.bits.coarse_y;
+		uint16_t fine_y = vAddr.bits.fine_y;
+		uint16_t nt_x = vAddr.bits.nametable_x;
+		uint16_t nt_y = vAddr.bits.nametable_y;
+
 		for (int col = 0; col < 256; col++) {
-			if (col < 8 && !mask.bits.render_bg_left) { pScreenBuffer[y * 256 + col] = 0xFF000000; continue; }
-			int sc_x = (coarseX << 3) + fineX + col, eff_nt = nt; if (sc_x >= 256) { sc_x -= 256; eff_nt ^= 1; } if (sc_x >= 256) { sc_x -= 256; eff_nt ^= 1; }
-			int tile_col = sc_x / 8, tile_row = coarseY; uint16_t nt_base = 0x2000 + (eff_nt * 0x400);
-			uint8_t tileID = InternalRead(nt_base + (tile_row * 32) + tile_col);
-			uint8_t attrByte = InternalRead((nt_base + 0x3C0) + ((tile_row >> 2) << 3) + (tile_col >> 2));
-			if (tile_row & 0x02) attrByte >>= 4; if (tile_col & 0x02) attrByte >>= 2;
-			uint16_t patternAddr = (ctrl.bits.bg_pattern << 12) + ((uint16_t)tileID << 4) + fineY;
-			uint8_t pLo = InternalRead(patternAddr), pHi = InternalRead(patternAddr + 8);
-			int pixelBit = 7 - (sc_x % 8); uint8_t pixelVal = ((pLo >> pixelBit) & 1) | (((pHi >> pixelBit) & 1) << 1);
-			if (pixelVal != 0) { bgOpacity[col] = true; pScreenBuffer[y * 256 + col] = SYSTEM_PALETTE[InternalRead(0x3F00 + ((attrByte & 3) << 2) + pixelVal) & 0x3F]; }
-			else { pScreenBuffer[y * 256 + col] = SYSTEM_PALETTE[InternalRead(0x3F00) & 0x3F]; }
+			if (col < 8 && !mask.bits.render_bg_left) continue;
+
+			// ドット単位の絶対X座標を計算
+			int total_x = col + fineX;
+			// 32タイル(256px)ごとにネームテーブルを切り替え
+			int current_nt_x = nt_x ^ ((initial_coarse_x + (total_x >> 3)) >> 5);
+			int current_coarse_x = (initial_coarse_x + (total_x >> 3)) & 31;
+
+			uint16_t nt_base = 0x2000 + ((nt_y << 1) | current_nt_x) * 0x400;
+			uint8_t tileID = InternalRead(nt_base + (coarse_y * 32) + current_coarse_x);
+
+			uint8_t attrByte = InternalRead((nt_base + 0x3C0) + ((coarse_y >> 2) << 3) + (current_coarse_x >> 2));
+			if (coarse_y & 0x02) attrByte >>= 4;
+			if (current_coarse_x & 0x02) attrByte >>= 2;
+
+			uint16_t patternAddr = (ctrl.bits.bg_pattern << 12) + ((uint16_t)tileID << 4) + fine_y;
+			uint8_t pLo = InternalRead(patternAddr);
+			uint8_t pHi = InternalRead(patternAddr + 8);
+
+			int pixelBit = 7 - (total_x % 8);
+			uint8_t pixelVal = ((pLo >> pixelBit) & 1) | (((pHi >> pixelBit) & 1) << 1);
+
+			if (pixelVal != 0) {
+				bgOpacity[col] = true;
+				pScreenBuffer[y * 256 + col] = SYSTEM_PALETTE[InternalRead(0x3F00 + ((attrByte & 3) << 2) + pixelVal) & 0x3F];
+			}
 		}
 	}
 	if (mask.bits.render_spr) {
@@ -517,19 +565,54 @@ void PPU::RenderScanline() {
 	}
 }
 void PPU::Clock() {
-	if (scanline >= 0 && scanline < 240) { if (cycle == 256) RenderScanline(); }
-	if (scanline == 241 && cycle == 1) { status.bits.vblank = 1; if (ctrl.bits.nmi_enable) nmiOccurred = true; }
-	if (scanline == 261 && cycle == 1) { status.bits.vblank = 0; status.bits.sprite_zero_hit = 0; status.bits.sprite_overflow = 0; frameComplete = true; }
-	if ((scanline >= 0 && scanline < 240) || scanline == 261) {
-		if (mask.bits.render_bg || mask.bits.render_spr) {
-			if (cycle == 256) {
-				if (vAddr.bits.fine_y < 7) vAddr.bits.fine_y++; else { vAddr.bits.fine_y = 0; uint8_t y = vAddr.bits.coarse_y; if (y == 29) { y = 0; vAddr.bits.nametable_y ^= 1; } else if (y == 31) y = 0; else y++; vAddr.bits.coarse_y = y; }
-			}
-			if (cycle == 257) { vAddr.bits.nametable_x = tAddr.bits.nametable_x; vAddr.bits.coarse_x = tAddr.bits.coarse_x; }
+	// 1. 【描画】スキャンラインの開始時に実行（座標更新前のクリーンな状態で描画）
+	if (cycle == 0 && scanline >= 0 && scanline < 240) {
+		RenderScanline();
+	}
+
+	// 2. 【IRQ通知】サイクル260（H-Blank中）
+	if (cycle == 260) {
+		if (((scanline >= 0 && scanline < 240) || scanline == 261) && (mask.bits.render_bg || mask.bits.render_spr)) {
+			if (pCart && pCart->pMapper) pCart->pMapper->notifyScanline();
 		}
 	}
-	if (scanline == 261 && (cycle >= 280 && cycle <= 304)) { if (mask.bits.render_bg || mask.bits.render_spr) { vAddr.bits.fine_y = tAddr.bits.fine_y; vAddr.bits.nametable_y = tAddr.bits.nametable_y; vAddr.bits.coarse_y = tAddr.bits.coarse_y; } }
-	cycle++; if (cycle >= 341) { cycle = 0; scanline++; if (scanline >= 262) { scanline = 0; frameComplete = false; } }
+
+	// 3. フラグ・VBlank処理
+	if (scanline == 241 && cycle == 1) {
+		status.bits.vblank = 1;
+		if (ctrl.bits.nmi_enable) nmiOccurred = true;
+	}
+	if (scanline == 261 && cycle == 1) {
+		status.bits.vblank = 0; status.bits.sprite_zero_hit = 0; status.bits.sprite_overflow = 0;
+	}
+
+	// 4. 【座標更新】描画後のタイミングで実行
+	if (mask.bits.render_bg || mask.bits.render_spr) {
+		if (cycle == 256 && (scanline < 240 || scanline == 261)) {
+			if (vAddr.bits.fine_y < 7) vAddr.bits.fine_y++;
+			else {
+				vAddr.bits.fine_y = 0; uint8_t y = vAddr.bits.coarse_y;
+				if (y == 29) { y = 0; vAddr.bits.nametable_y ^= 1; }
+				else if (y == 31) y = 0; else y++;
+				vAddr.bits.coarse_y = y;
+			}
+		}
+		if (cycle == 257 && (scanline < 240 || scanline == 261)) {
+			vAddr.bits.nametable_x = tAddr.bits.nametable_x;
+			vAddr.bits.coarse_x = tAddr.bits.coarse_x;
+		}
+		if (scanline == 261 && cycle >= 280 && cycle <= 304) {
+			vAddr.bits.fine_y = tAddr.bits.fine_y;
+			vAddr.bits.nametable_y = tAddr.bits.nametable_y;
+			vAddr.bits.coarse_y = tAddr.bits.coarse_y;
+		}
+	}
+
+	cycle++;
+	if (cycle >= 341) {
+		cycle = 0; scanline++;
+		if (scanline >= 262) { scanline = 0; frameComplete = true; }
+	}
 }
 void PPU::UpdateNametables() {
 	MIRROR m = pCart ? pCart->GetMirror() : VERTICAL; currentMirrorMode = m;
@@ -632,41 +715,69 @@ public:
 	CPU cpu; PPU ppu; APU apu; Bus bus; std::shared_ptr<Cartridge> cart; std::vector<uint32_t> displayBuffer; bool isLoaded = false;
 	NESCore() : cpu(bus), ppu(bus), apu(bus), bus(cpu, ppu, apu) { displayBuffer.resize(NES_WIDTH * NES_HEIGHT); ppu.SetScreenBuffer(displayBuffer.data()); }
 	bool LoadRom(const std::wstring& path) { cart = std::make_shared<Cartridge>(&bus); if (!cart->Load(path)) return false; bus.SetCart(cart.get()); ppu.SetCart(cart.get()); cpu.Reset(); ppu.Reset(); apu.Reset(); return (isLoaded = true); }
-	void StepFrame() {
-
-
-
+	void NESCore::StepFrame() {
 		if (!isLoaded) return;
 
+		// 入力取得 (既存)
 		{
-			// Windowsメッセージに頼らず、現在のキー状態を直接取得
 			auto check = [](int vkey) { return (GetAsyncKeyState(vkey) & 0x8000) ? 1 : 0; };
-
 			uint8_t state = 0;
-			state |= (check('X') << 0);       // A
-			state |= (check('Z') << 1);       // B
-			state |= (check(VK_SHIFT) << 2);  // Select
-			state |= (check(VK_RETURN) << 3); // Start
-			state |= (check(VK_UP) << 4);
-			state |= (check(VK_DOWN) << 5);
-			state |= (check(VK_LEFT) << 6);
-			state |= (check(VK_RIGHT) << 7);
-
+			state |= (check('X') << 0); state |= (check('Z') << 1);
+			state |= (check(VK_SHIFT) << 2); state |= (check(VK_RETURN) << 3);
+			state |= (check(VK_UP) << 4); state |= (check(VK_DOWN) << 5);
+			state |= (check(VK_LEFT) << 6); state |= (check(VK_RIGHT) << 7);
 			bus.controller[0] = state;
 		}
-
-		const int CPU_CYCLES = 29780; int cycles = 0, step = 1;
-		while (cycles < CPU_CYCLES) {
-			for (int i = 0; i < step * 3; i++) { ppu.Clock(); if (ppu.nmiOccurred) { ppu.nmiOccurred = false; cpu.NMI(); } }
-			cart->Tick(step); if (cart->GetIRQ()) cpu.IRQ();
+		const int MAX_CYCLES = 29780;
+		int total_cycles = 0;
+		while (total_cycles < MAX_CYCLES) {
 			if (bus.dma_transfer) {
-				bus.dma_transfer = false; uint16_t off = (uint16_t)bus.dma_page << 8;
-				for (int i = 0; i < 256; i++) ((uint8_t*)ppu.primaryOAM)[(bus.dma_addr + i) & 0xFF] = bus.cpuRead(off + i);
-				for (int i = 0; i < 513 * 3; i++) { ppu.Clock(); if (ppu.nmiOccurred) { ppu.nmiOccurred = false; cpu.NMI(); } }
-				cycles += 513; cart->Tick(513);
+				// DMA処理 (既存の修正版)
+				bus.dma_transfer = false;
+				uint16_t off = (uint16_t)bus.dma_page << 8;
+				for (int i = 0; i < 256; i++) {
+					((uint8_t*)ppu.primaryOAM)[(bus.dma_addr + i) & 0xFF] = bus.cpuRead(off + i);
+					for (int k = 0; k < 2; k++) {
+						for (int p = 0; p < 3; p++) {
+							ppu.Clock();
+							if (ppu.nmiOccurred) { ppu.nmiOccurred = false; cpu.NMI(); }
+						}
+						cart->Tick(1); total_cycles++;
+					}
+				}
+				for (int p = 0; p < 3; p++) ppu.Clock();
+				cart->Tick(1); total_cycles++;
 			}
-			else { cpu.Run(step); cycles += step; }
-		} ppu.frameComplete = false;
+			else {
+				// 【重要】命令の開始直前にIRQを確認
+				// これにより、ジッター（タイミングの揺れ）を最小限に抑えます
+				if (cart->GetIRQ()) {
+					cpu.IRQ();
+				}
+
+				int before = cpu.cyclesLeft;
+				cpu.Run(1); // 1命令実行
+				int spent = abs(cpu.cyclesLeft - before);
+				if (spent <= 0) spent = 2;
+
+				// 消費サイクル分、PPUとマッパーを刻む
+				for (int i = 0; i < spent; i++) {
+					for (int p = 0; p < 3; p++) {
+						ppu.Clock();
+						if (ppu.nmiOccurred) {
+							ppu.nmiOccurred = false;
+							cpu.NMI();
+						}
+					}
+					cart->Tick(1);
+					total_cycles++;
+				}
+				cpu.cyclesLeft = 0;
+			}
+
+			if (ppu.frameComplete) break;
+		}
+		ppu.frameComplete = false;
 	}
 };
 class App {
