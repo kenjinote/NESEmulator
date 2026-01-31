@@ -632,9 +632,29 @@ public:
 	CPU cpu; PPU ppu; APU apu; Bus bus; std::shared_ptr<Cartridge> cart; std::vector<uint32_t> displayBuffer; bool isLoaded = false;
 	NESCore() : cpu(bus), ppu(bus), apu(bus), bus(cpu, ppu, apu) { displayBuffer.resize(NES_WIDTH * NES_HEIGHT); ppu.SetScreenBuffer(displayBuffer.data()); }
 	bool LoadRom(const std::wstring& path) { cart = std::make_shared<Cartridge>(&bus); if (!cart->Load(path)) return false; bus.SetCart(cart.get()); ppu.SetCart(cart.get()); cpu.Reset(); ppu.Reset(); apu.Reset(); return (isLoaded = true); }
-	void InputKey(int id, bool pressed) { if (id >= 0 && id < 8) { if (pressed) bus.controller[0] |= (1 << id); else bus.controller[0] &= ~(1 << id); } }
 	void StepFrame() {
+
+
+
 		if (!isLoaded) return;
+
+		{
+			// Windowsメッセージに頼らず、現在のキー状態を直接取得
+			auto check = [](int vkey) { return (GetAsyncKeyState(vkey) & 0x8000) ? 1 : 0; };
+
+			uint8_t state = 0;
+			state |= (check('X') << 0);       // A
+			state |= (check('Z') << 1);       // B
+			state |= (check(VK_SHIFT) << 2);  // Select
+			state |= (check(VK_RETURN) << 3); // Start
+			state |= (check(VK_UP) << 4);
+			state |= (check(VK_DOWN) << 5);
+			state |= (check(VK_LEFT) << 6);
+			state |= (check(VK_RIGHT) << 7);
+
+			bus.controller[0] = state;
+		}
+
 		const int CPU_CYCLES = 29780; int cycles = 0, step = 1;
 		while (cycles < CPU_CYCLES) {
 			for (int i = 0; i < step * 3; i++) { ppu.Clock(); if (ppu.nmiOccurred) { ppu.nmiOccurred = false; cpu.NMI(); } }
@@ -678,6 +698,12 @@ public:
 			if (PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); continue; }
 			QueryPerformanceCounter(&c); double el = (double)(c.QuadPart - l.QuadPart) / f.QuadPart;
 			if (el >= SPF) {
+				//if (el > SPF * 2) {
+				//	l.QuadPart = c.QuadPart;
+				//}
+				//else {
+				//	l.QuadPart += (LONGLONG)(SPF * f.QuadPart);
+				//}
 				l.QuadPart += (LONGLONG)(SPF * f.QuadPart); if ((double)(c.QuadPart - l.QuadPart) / f.QuadPart > SPF) l.QuadPart = c.QuadPart;
 				if (m_nes.isLoaded) { m_nes.StepFrame(); m_nes.apu.Step(CPF); if (!m_nes.apu.buffer.empty()) { m_aud.PushSamples(m_nes.apu.buffer); m_nes.apu.buffer.clear(); } }
 				if (m_pRT || (CreateDeviceResources(), m_pRT)) {
@@ -702,7 +728,13 @@ public:
 					   else if (LOWORD(w) == IDM_FILE_EXIT) DestroyWindow(h); else if (LOWORD(w) == IDM_FILE_FULLSCREEN && p) p->ToggleFullscreen(); return 0;
 		case WM_NCHITTEST: { LRESULT r = DefWindowProc(h, m, w, l); return (r == HTCLIENT && p && !p->m_fs) ? HTCAPTION : r; }
 		case WM_SIZE: if (p && p->m_pRT) p->m_pRT->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l))); return 0;
-		case WM_KEYDOWN: case WM_KEYUP: if (p) { if (m == WM_KEYDOWN && w == VK_F11) { p->ToggleFullscreen(); return 0; } if (m == WM_KEYDOWN && w == VK_ESCAPE && p->m_fs) { p->ToggleFullscreen(); return 0; } int id = (w == 'X') ? 0 : (w == 'Z') ? 1 : (w == VK_SHIFT) ? 2 : (w == VK_RETURN) ? 3 : (w == VK_UP) ? 4 : (w == VK_DOWN) ? 5 : (w == VK_LEFT) ? 6 : (w == VK_RIGHT) ? 7 : -1; p->m_nes.InputKey(id, m == WM_KEYDOWN); } return 0;
+		case WM_KEYDOWN:
+		case WM_KEYUP:
+			if (p) {
+				if (m == WM_KEYDOWN && w == VK_F11) { p->ToggleFullscreen(); return 0; }
+				if (m == WM_KEYDOWN && w == VK_ESCAPE && p->m_fs) { p->ToggleFullscreen(); return 0; }
+				return 0;
+			}
 		case WM_DROPFILES: if (p) { wchar_t f[MAX_PATH]; if (DragQueryFile((HDROP)w, 0, f, MAX_PATH)) { p->OpenRomFile(f); SetForegroundWindow(h); SetFocus(h); } DragFinish((HDROP)w); } return 0;
 		case WM_DESTROY: PostQuitMessage(0); return 0;
 		} return DefWindowProc(h, m, w, l);
